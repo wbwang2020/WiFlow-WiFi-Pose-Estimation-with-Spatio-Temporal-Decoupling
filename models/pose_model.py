@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import Parameter
 import torch.nn.functional as F
-from models.tcn import TemporalConvNet
+from models.tcn import TemporalBlock
 from models.convnet import ConvBlock1, AsymmetricConvBlock
 from models.attention import DualAxialAttention
 
@@ -13,11 +13,12 @@ class WiFlowPoseModel(nn.Module):
         super().__init__()
 
         # 时序卷积网络
-        self.tcn = TemporalConvNet(
+        self.tcn = TemporalBlock(
             num_inputs=540,
-            num_channels=[540, 440, 360, 240],
+            num_channels=[540, 440, 340, 240],
             kernel_size=3,
-            dropout=dropout
+            dropout=dropout,
+            attention_type='none'  # 'se', 'cbam', 'none'
         )
 
         # 初始卷积块
