@@ -1,39 +1,112 @@
-import scipy.io as sio
-from torch.utils.data import TensorDataset, DataLoader
-import numpy as np
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
 import torch.nn.functional as F
-import math
-import time
-import sys
-import glob
-import hdf5storage
-from random import shuffle
-import time
+# 别忘了 pip install performer-pytorch
+from performer_pytorch import Performer
 import os
+import time
+import random
+import numpy as np
 import pandas as pd
-from torch.utils.data import Dataset, DataLoader
-import copy
-from tqdm import tqdm
 import matplotlib.pyplot as plt
-import cv2
-from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import hdf5storage
 
 # ============================== #
-# 数据加载和转换相关代码（修改为支持PAM格式）
+# 修复字体设置
 # ============================== #
+try:
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Liberation Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    plt.rcParams['font.family'] = 'sans-serif'
+    print("字体设置成功")
+except Exception as e:
+    print(f"字体设置错误: {e}")
 
+def safe_text(text):
+    """如果需要，将中文字符转换为英文等效字符"""
+    try:
+        translation = {
+            '样本': 'Sample',
+            '真实姿态': 'True Pose',
+            '预测姿态': 'Predicted Pose',
+            '帧': 'Frame',
+            '身体部位': 'Body Parts',
+            '头部': 'Head',
+            '躯干': 'Torso',
+            '左臂': 'Left Arm',
+            '右臂': 'Right Arm',
+            '左腿': 'Left Leg',
+            '右腿': 'Right Leg',
+            '人体姿态': 'Human Pose',
+            '中心点/颈部': 'Neck/Center',
+            '胸部中心': 'Chest Center',
+            '左肩': 'Left Shoulder',
+            '右肩': 'Right Shoulder',
+            '左肘': 'Left Elbow',
+            '右肘': 'Right Elbow',
+            '左手腕': 'Left Wrist',
+            '右手腕': 'Right Wrist',
+            '骨盆': 'Pelvis',
+            '左髋': 'Left Hip',
+            '右髋': 'Right Hip',
+            '左膝': 'Left Knee',
+            '右膝': 'Right Knee',
+            '左踝': 'Left Ankle',
+            '右踝': 'Right Ankle',
+            '左颊': 'Left Cheek',
+            '右颊': 'Right Cheek',
+            '左耳': 'Left Ear',
+            '右耳': 'Right Ear',
+            '左脚大拇指': 'Left Foot Thumb',
+            '右脚大拇指': 'Right Foot Thumb',
+            '右脚小拇指': 'Right Foot Pinky',
+            '左脚小拇指': 'Left Foot Pinky',
+            '左脚跟': 'Left Heel',
+            '右脚跟': 'Right Heel',
+            '对比视频进度': 'Comparison Video Progress',
+            '视频生成进度': 'Video Generation Progress',
+            '开始生成视频': 'Starting Video Generation',
+            '视频生成完成': 'Video Generation Complete',
+            '对比视频生成完成': 'Comparison Video Complete'
+        }
+
+        for cn, en in translation.items():
+            if cn in text:
+                text = text.replace(cn, en)
+        return text
+    except:
+        return text
+
+# ============================== #
+# 1. 定义要保留的关键点
+# ============================== #
 KEEP_KEYPOINTS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
 KEYPOINT_MAPPING = {old_idx: new_idx for new_idx, old_idx in enumerate(KEEP_KEYPOINTS)}
 
+# ============================== #
+# 全局配置和实用函数
+# ============================== #
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
+# ============================== #
+# 数据集和数据加载器
+# ============================== #
 class PreprocessedCSIKeypointsDataset(Dataset):
     """使用预处理后的CSI数据和PAM格式标签的数据集（优化版本）"""
 
     def __init__(self, csi_data_dir, pam_label_dir, keypoint_scale=1000.0, transform=None, enable_zero_clean=True):
-        self.csi_windows = np.load(os.path.join(csi_data_dir, "csi_windows.npy"))
+        # 使用内存映射模式，数据只在需要时才从硬盘读取，瞬间省下 15GB 内存！
+        self.csi_windows = np.load(os.path.join(csi_data_dir, "csi_windows.npy"), mmap_mode='r')
 
         window_info = np.load(os.path.join(csi_data_dir, "window_info.npz"))
         self.window_to_file = window_info['window_to_file']
@@ -186,17 +259,17 @@ class PreprocessedCSIKeypointsDataset(Dataset):
         start_idx, end_idx = self.window_ranges[file_idx]
         return list(range(start_idx, end_idx))
 
-def create_train_val_test_loaders(dataset, batch_size=32, num_workers=0, random_seed=42):
+def create_preprocessed_train_val_test_loaders(dataset, batch_size=64, num_workers=0, random_seed=42):
     """按文件级别划分预处理后的数据集"""
     # 设置随机种子
-    np.random.seed(random_seed)
+    random.seed(random_seed)
 
     # 获取所有文件索引
     file_indices = dataset.get_file_indices()
     total_files = len(file_indices)
 
     # 随机打乱文件顺序
-    np.random.shuffle(file_indices)
+    random.shuffle(file_indices)
 
     # 按比例划分文件
     train_ratio, val_ratio = 0.7, 0.15
@@ -232,13 +305,16 @@ def create_train_val_test_loaders(dataset, batch_size=32, num_workers=0, random_
     test_dataset = torch.utils.data.Subset(dataset, test_indices)
 
     # 创建数据加载器
+    # 稍微规范一下 DataLoader 参数
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         pin_memory=True,
         num_workers=num_workers,
-        drop_last=True
+        # 改成这样更稳妥：
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
     val_loader = DataLoader(
@@ -247,7 +323,8 @@ def create_train_val_test_loaders(dataset, batch_size=32, num_workers=0, random_
         shuffle=False,
         pin_memory=True,
         num_workers=num_workers,
-        drop_last=True
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
     test_loader = DataLoader(
@@ -256,138 +333,132 @@ def create_train_val_test_loaders(dataset, batch_size=32, num_workers=0, random_
         shuffle=False,
         pin_memory=True,
         num_workers=num_workers,
-        drop_last=True
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
     return train_loader, val_loader, test_loader
 
+class DoubleConv(nn.Module):
+    """Unet 基础双层卷积块"""
 
-# ============================== #
-# CSI数据格式转换函数
-# ============================== #
-
-def convert_csi_format(csi_data_code2):
-    """
-    将代码2的CSI数据格式转换为代码1的格式
-    输入: [batch_size, 540, 20]
-    输出: [batch_size, 600, 3, 6]
-    """
-    batch_size = csi_data_code2.shape[0]
-
-    # 步骤1: 分离两个接收端
-    csi_split = csi_data_code2.view(batch_size, 2, 270, 20)
-
-    # 步骤2: 每个接收端重塑为 (30子载波, 3发送天线, 3接收天线)
-    csi_reshaped = csi_split.view(batch_size, 2, 30, 3, 3, 20)
-
-    # 步骤3: 调整维度顺序，将时间维度移到前面
-    csi_reordered = csi_reshaped.permute(0, 1, 5, 2, 3, 4)
-
-    # 步骤4: 合并时间和子载波维度，同时合并两个接收端的接收天线
-    batch_size, num_receivers, time_steps, num_subcarriers, tx_antennas, rx_antennas = csi_reordered.shape
-
-    # 重塑为最终格式
-    csi_final = csi_reordered.contiguous().view(
-        batch_size,
-        time_steps * num_subcarriers,  # 600 = 20 × 30
-        tx_antennas,  # 3
-        num_receivers * rx_antennas  # 6 = 2 × 3
-    )
-
-    return csi_final
-
-
-# ============================== #
-# ResNet模型（修改输出为2通道的PAM）
-# ============================== #
-
-def conv3x3(in_channels, out_channels, stride=1):
-    return nn.Conv2d(in_channels, out_channels, kernel_size=3,
-                     stride=stride, padding=1, bias=False)
-
-
-class ResidualBlock(nn.Module):
-    expansion = 1
-
-    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = conv3x3(in_channels, out_channels, stride)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(out_channels, out_channels)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.downsample = downsample
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
     def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
-        if self.downsample:
-            residual = self.downsample(x)
-        out += residual
-        out = self.relu(out)
+        return self.double_conv(x)
+
+
+class PerUnet_Baseline(nn.Module):
+    """
+    遵循严密物理映射的修改版 PerUnet
+    完全符合 [B, 540, 20] -> [B, 600, 3, 6] 的重塑逻辑
+    """
+
+    def __init__(self):
+        super(PerUnet_Baseline, self).__init__()
+
+        # === 1. Unet 编码器 (Encoder) ===
+        # 根据你的设计，进入 Layer 1 时就是 600 通道
+        self.inc = DoubleConv(600, 600)
+        self.pool1 = nn.MaxPool2d(2)  # 24x24 -> 12x12
+
+        self.down1 = DoubleConv(600, 1200)
+        self.pool2 = nn.MaxPool2d(2)  # 12x12 -> 6x6
+
+        self.down2 = DoubleConv(1200, 2400)
+        self.pool3 = nn.MaxPool2d(2)  # 6x6 -> 3x3
+
+        # 底部瓶颈层
+        self.bot = DoubleConv(2400, 2400)
+
+        # === 2. 跳跃连接 1 中的 Performer ===
+        # 原论文在 SC1 处理浅层特征，通道数为 600
+        self.performer_sc1 = Performer(
+            dim=600,
+            depth=3,
+            heads=4,
+            dim_head=64,
+            causal=False
+        )
+
+        # === 3. Unet 解码器 (Decoder) ===
+        # Up 1: 瓶颈层 2400 上采样 -> 1200, 拼接 down2 的 2400 -> 3600
+        self.up1 = nn.ConvTranspose2d(2400, 1200, kernel_size=2, stride=2)
+        self.up_conv1 = DoubleConv(3600, 1200)
+
+        # Up 2: 1200 上采样 -> 600, 拼接 down1 的 1200 -> 1800
+        self.up2 = nn.ConvTranspose2d(1200, 600, kernel_size=2, stride=2)
+        self.up_conv2 = DoubleConv(1800, 600)
+
+        # Up 3: 600 上采样 -> 600, 拼接 Performer 出来的 600 -> 1200
+        self.up3 = nn.ConvTranspose2d(600, 600, kernel_size=2, stride=2)
+        self.up_conv3 = DoubleConv(1200, 600)
+
+        # 4. Scale Matching (尺度匹配) [cite: 279]
+        # 最终输出需要匹配 2 x 15 x 15 的位姿标注维度 [cite: 280]
+        self.scale_match = nn.Sequential(
+            nn.Conv2d(600, 150, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(150, 2, kernel_size=3, padding=1)  # 输出通道为3 (x, y, c) [cite: 280]
+            # 为了达到 15x15，可以加入一个插值或额外的自适应池化层
+        )
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((15, 15))
+
+    def forward(self, x):
+        # 你的输入: [B, 540, 20]
+        b = x.shape[0]
+
+        # --- 0. 神来之笔：严格物理维度重组 ---
+        # 拆解: 540 = 30(子载波) * 18(空间)
+        x = x.view(b, 30, 18, 20)
+        # 换位: [B, 子载波, 空间, 时间] -> [B, 时间, 子载波, 空间]
+        x = x.permute(0, 3, 1, 2).contiguous()  # [B, 20, 30, 18]
+        # 合并时间与频率作为 Channel: 20 * 30 = 600, 空间重塑为 3x6
+        x = x.view(b, 600, 3, 6)
+
+        # --- 1. Patch Magnification ---
+        x = F.interpolate(x, size=(24, 24), mode='bilinear', align_corners=False)
+
+        # --- 2. Encoder ---
+        x1 = self.inc(x)  # [B, 600, 24, 24]
+        x2 = self.down1(self.pool1(x1))  # [B, 1200, 12, 12]
+        x3 = self.down2(self.pool2(x2))  # [B, 2400, 6, 6]
+        bot = self.bot(self.pool3(x3))  # [B, 2400, 3, 3]
+
+        # --- 3. Attention-Based Denoising (SC 1) ---
+        _, c, h, w = x1.shape
+        x1_flat = x1.view(b, c, -1).permute(0, 2, 1)  # [B, 576, 600]
+        x1_att = self.performer_sc1(x1_flat)
+        x1_att = x1_att.permute(0, 2, 1).view(b, c, h, w)  # [B, 600, 24, 24]
+
+        # --- 4. Decoder & Skip Connections ---
+        u3 = self.up1(bot)  # [B, 1200, 6, 6]
+        u3 = torch.cat([u3, x3], dim=1)  # [B, 3600, 6, 6]
+        u3 = self.up_conv1(u3)  # [B, 1200, 6, 6]
+
+        u2 = self.up2(u3)  # [B, 600, 12, 12]
+        u2 = torch.cat([u2, x2], dim=1)  # [B, 1800, 12, 12]
+        u2 = self.up_conv2(u2)  # [B, 600, 12, 12]
+
+        u1 = self.up3(u2)  # [B, 600, 24, 24]
+        u1 = torch.cat([u1, x1_att], dim=1)  # [B, 1200, 24, 24] 注意力融合
+        u1 = self.up_conv3(u1)  # [B, 600, 24, 24]
+
+        # --- 5. 尺度匹配与坐标回归 ---
+        # 5) Scale Matching [cite: 279]
+        out = self.scale_match(u1)  # [B, 2, 24, 24]
+        out = self.adaptive_pool(out)  # [B, 2, 15, 15] [cite: 280]
+
         return out
-
-
-class ResNet(nn.Module):
-    def __init__(self, block, layers, input_channels=600):
-        super(ResNet, self).__init__()
-
-        self.in_channels = input_channels
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(self.in_channels, self.in_channels, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(self.in_channels),
-            nn.ReLU(inplace=True),
-        )
-
-        self.layer1 = self.make_layer(block, self.in_channels, layers[0])
-        self.layer2 = self.make_layer(block, 600, layers[1], 2)
-        self.layer3 = self.make_layer(block, 1024, layers[2], 2)
-        self.layer4 = self.make_layer(block, 1024, layers[3], 2)
-
-        self.decode = nn.Sequential(
-            nn.Conv2d(1024, 256, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 2, kernel_size=1, stride=1, padding=0, bias=False),  # 输出2通道(x', y')
-        )
-
-    def make_layer(self, block, out_channels, blocks, stride=1):
-        downsample = None
-        if (stride != 1) or (self.in_channels != out_channels * block.expansion):
-            downsample = nn.Sequential(
-                conv3x3(self.in_channels, out_channels * block.expansion, stride=stride),
-                nn.BatchNorm2d(out_channels * block.expansion))
-        layers = []
-        layers.append(block(self.in_channels, out_channels, stride, downsample))
-        self.in_channels = out_channels * block.expansion
-        for i in range(1, blocks):
-            layers.append(block(self.in_channels, out_channels))
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        # 输入: [batch_size, 600, 3, 6]
-        # 上采样到对称的分辨率
-        x = F.interpolate(x, size=(120, 120), mode='bilinear', align_corners=False)
-
-        x = self.conv1(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-
-        x = self.decode(x)
-        # 输出: [batch_size, 2, height, width]
-
-        # 最终输出: [batch_size, 2, 15, 15]
-        return x
-
 
 # ============================== #
 # 关键点提取函数（从PAM对角线提取）
@@ -461,7 +532,6 @@ def calculate_pck_metrics(pred_coords, true_coords, thresholds=[0.1, 0.2, 0.3, 0
         pck_results[threshold] = pck
 
     return pck_results
-
 
 # ============================== #
 # 姿态可视化相关设置
@@ -907,20 +977,19 @@ def create_side_by_side_video_opencv(true_keypoints, pred_keypoints, output_file
 # ============================== #
 # 主训练函数（使用PAM格式）
 # ============================== #
-def train_wisppn_pam_model(train_loader, val_loader, test_loader,
-                           batch_size=32, num_epochs=20, learning_rate=0.001,
-                           keypoint_scale=1000.0, output_dir="wisppn_pam_results"):
-    """训练使用PAM格式标签的WISPPN模型（与原始代码保持一致）"""
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+def train(train_loader, val_loader, test_loader,
+                           batch_size=32, num_epochs=50, learning_rate=0.005,
+                           keypoint_scale=1000.0, output_dir="perunet"):
+    """训练使用PAM格式标签的perunet 模型（与原始代码保持一致）"""
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
     # 初始化模型
-    print("初始化WISPPN模型（PAM版本）...")
-    wisppn = ResNet(ResidualBlock, [2, 2, 2, 2], input_channels=600)
-    wisppn = wisppn.cuda()
+    print("初始化perunet模型（PAM版本）...")
+    perunet = PerUnet_Baseline().to(device)
 
     # ========== 极简模型统计（只要这几行） ==========
     # 1. 计算总参数量
-    total_params = sum(p.numel() for p in wisppn.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in perunet.parameters() if p.requires_grad)
     print(f"\n📊 模型总参数量: {total_params:,} ({total_params / 1e6:.2f}M)")
 
     # 2. 计算FLOPs
@@ -929,11 +998,10 @@ def train_wisppn_pam_model(train_loader, val_loader, test_loader,
         import copy
 
         # 创建正确大小的测试输入
-        model_copy = copy.deepcopy(wisppn)
+        model_copy = copy.deepcopy(perunet)
         model_copy.eval()
 
-        # 注意：输入应该是转换后的格式 [1, 600, 3, 6]
-        test_input = torch.randn(1, 600, 3, 6).to(device)
+        test_input = torch.randn(1, 540, 20).to(device)
 
         with torch.no_grad():
             flops, params = profile(model_copy, inputs=(test_input,), verbose=False)
@@ -949,20 +1017,36 @@ def train_wisppn_pam_model(train_loader, val_loader, test_loader,
         print("💻 跳过FLOPs计算，继续训练...")
 
     # 损失函数和优化器
-    criterion_L2 = nn.MSELoss().cuda()
-    optimizer = torch.optim.Adam(wisppn.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 15, 20, 25, 30], gamma=0.5)
+    criterion_L2 = nn.MSELoss().to(device)
+    optimizer = torch.optim.Adam(perunet.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 20, 30, 40], gamma=0.5)
 
-    # 训练历史记录（只记录训练损失）
+    # ============================== #
+    # 新增：断点续训加载逻辑
+    # ============================== #
+    start_epoch = 0
     train_losses = []
+    checkpoint_path = os.path.join('weights', 'latest_checkpoint.pth')
+
+    if os.path.exists(checkpoint_path):
+        print(f"\n[INFO] 发现断点文件 {checkpoint_path}，正在恢复训练...")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        perunet.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        train_losses = checkpoint['train_losses']
+        print(f"[INFO] 成功恢复！将从 Epoch {start_epoch + 1} 继续训练...\n")
+    else:
+        print("\n[INFO] 未找到断点文件，将从头开始训练...")
 
     # ============================== #
     # 训练循环（与原始代码一致，无验证）
     # ============================== #
     print("开始训练（使用PAM标签）...")
-    wisppn.train()
+    perunet.train()
 
-    for epoch_index in range(num_epochs):
+    for epoch_index in range(start_epoch, num_epochs):
         start = time.time()
 
         # 打乱数据（原始代码中的shuffle(mats)）
@@ -975,26 +1059,36 @@ def train_wisppn_pam_model(train_loader, val_loader, test_loader,
 
         for batch_index, (csi_batch, pam_batch) in enumerate(train_loop):
             # 转换CSI格式
-            csi_data = convert_csi_format(csi_batch).cuda()
+            csi_data = csi_batch.to(device)
+
+            # ===== 新增：拦截毒数据 =====
+            if torch.isnan(csi_data).any() or torch.isinf(csi_data).any():
+                print(f"\n[警告] Batch {batch_index}: CSI 数据中包含 NaN 或 Inf，跳过此批次！")
+                continue
+
+            if torch.isnan(pam_batch).any() or torch.isinf(pam_batch).any():
+                print(f"\n[警告] Batch {batch_index}: PAM 标签中包含 NaN 或 Inf，跳过此批次！")
+                continue
+            # ============================
 
             # PAM标签处理（与原始代码一致）
-            xy = pam_batch[:, 0:2, :, :].cuda()  # x'和y'通道
-            confidence = pam_batch[:, 2:4, :, :].cuda()  # 置信度通道（原始代码用2个通道）
+            xy = pam_batch[:, 0:2, :, :].to(device) # x'和y'通道
+            confidence = pam_batch[:, 2:4, :, :].to(device)  # 置信度通道（原始代码用2个通道）
 
             # 如果只有3个通道，复制置信度通道
             if pam_batch.shape[1] == 3:
-                confidence = pam_batch[:, 2:3, :, :].cuda()
+                confidence = pam_batch[:, 2:3, :, :].to(device)
                 confidence = confidence.repeat(1, 2, 1, 1)  # 扩展为2个通道
 
             # 前向传播
-            pred_xy = wisppn(csi_data)
+            pred_xy = perunet(csi_data)
 
             # 计算损失（与原始代码完全一致）
             loss = criterion_L2(torch.mul(confidence, pred_xy), torch.mul(confidence, xy))
 
-            # 打印损失（原始代码的print(loss.item())）
-            if batch_index % 10 == 0:  # 每10个批次打印一次
-                print(f"Batch {batch_index}: {loss.item():.6f}")
+            # # 打印损失（原始代码的print(loss.item())）
+            # if batch_index % 10 == 0:  # 每10个批次打印一次
+            #     print(f"Batch {batch_index}: {loss.item():.6f}")
 
             # 记录损失
             epoch_losses.append(loss.item())
@@ -1017,17 +1111,30 @@ def train_wisppn_pam_model(train_loader, val_loader, test_loader,
 
         scheduler.step()  # 移到这里
 
+        # ============================== #
+        # 新增：每个 Epoch 结束后保存一次断点
+        # ============================== #
+        os.makedirs('weights', exist_ok=True)
+        torch.save({
+            'epoch': epoch_index,
+            'model_state_dict': perunet.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'train_losses': train_losses
+        }, checkpoint_path)
+        print(f"[SAVE] 已保存 Epoch {epoch_index + 1} 的断点数据。")
+
     # 保存模型（与原始代码一致）
     os.makedirs('weights', exist_ok=True)
-    model_path = f'weights/wisppn-{num_epochs}epochs.pkl'
-    torch.save(wisppn, model_path)
+    model_path = f'weights/perunet-{num_epochs}epochs.pkl'
+    torch.save(perunet, model_path)
     print(f"模型已保存到 {model_path}")
 
     # ============================== #
     # 测试阶段（类似原始代码，但添加评估指标）
     # ============================== #
     print("\n开始测试...")
-    wisppn = wisppn.cuda().eval()
+    perunet = perunet.to(device).eval()
 
     # 用于保存所有预测和真实坐标
     all_pred_coords = []
@@ -1042,15 +1149,25 @@ def train_wisppn_pam_model(train_loader, val_loader, test_loader,
 
         for batch_idx, (csi_batch, pam_batch) in enumerate(test_loop):
             # 转换CSI格式
-            csi_data = convert_csi_format(csi_batch).cuda()
+            csi_data = csi_batch.to(device)
+
+            # ===== 新增：拦截毒数据 =====
+            if torch.isnan(csi_data).any() or torch.isinf(csi_data).any():
+                print(f"\n[警告] Batch {batch_index}: CSI 数据中包含 NaN 或 Inf，跳过此批次！")
+                continue
+
+            if torch.isnan(pam_batch).any() or torch.isinf(pam_batch).any():
+                print(f"\n[警告] Batch {batch_index}: PAM 标签中包含 NaN 或 Inf，跳过此批次！")
+                continue
+            # ============================
 
             # 前向传播
-            pred_xy = wisppn(csi_data)  # 输出 [batch_size, 2, 15, 15]
+            pred_xy = perunet(csi_data)  # 输出 [batch_size, 2, 15, 15]
 
             # 从PAM对角线提取关键点坐标（与原始测试代码一致）
             batch_size = pred_xy.shape[0]
-            pred_keypoints = torch.zeros(batch_size, 15, 2).cuda()
-            true_keypoints = torch.zeros(batch_size, 15, 2).cuda()
+            pred_keypoints = torch.zeros(batch_size, 15, 2).to(device)
+            true_keypoints = torch.zeros(batch_size, 15, 2).to(device)
 
             for b in range(batch_size):
                 for index in range(15):
@@ -1059,9 +1176,8 @@ def train_wisppn_pam_model(train_loader, val_loader, test_loader,
                     pred_keypoints[b, index, 1] = pred_xy[b, 1, index, index]  # y坐标
 
                     # 从真实PAM提取坐标
-                    true_keypoints[b, index, 0] = pam_batch[b, 0, index, index].cuda()
-                    true_keypoints[b, index, 1] = pam_batch[b, 1, index, index].cuda()
-
+                    true_keypoints[b, index, 0] = pam_batch[b, 0, index, index].to(device)
+                    true_keypoints[b, index, 1] = pam_batch[b, 1, index, index].to(device)
             # 保存坐标用于视频生成
             all_pred_coords.extend(pred_keypoints.cpu().numpy())
             all_true_coords.extend(true_keypoints.cpu().numpy())
@@ -1184,14 +1300,14 @@ def train_wisppn_pam_model(train_loader, val_loader, test_loader,
 
     print(f"\n所有结果已保存到: {output_dir}")
 
-    return wisppn, test_results
+    return perunet, test_results
 
 
 def main():
     # 训练参数
     batch_size = 32
-    num_epochs = 20
-    learning_rate = 0.001
+    num_epochs = 50
+    learning_rate = 0.005
 
     # 数据目录
     csi_data_dir = "preprocessed_csi_data"  # CSI预处理数据
@@ -1216,30 +1332,30 @@ def main():
     )
 
     # 创建数据加载器
-    train_loader, val_loader, test_loader = create_train_val_test_loaders(
+    train_loader, val_loader, test_loader = create_preprocessed_train_val_test_loaders(
         dataset=full_dataset,
         batch_size=batch_size,
-        num_workers=0
+        num_workers=4
     )
 
-    # 测试数据加载
-    print("\n测试数据加载...")
-    for csi_batch, pam_batch in train_loader:
-        print(f"CSI数据形状: {csi_batch.shape}")  # [batch_size, 540, 20]
-        print(f"PAM标签形状: {pam_batch.shape}")  # [batch_size, 4, 15, 15]
-        print(f"  - x'通道形状: {pam_batch[:, 0, :, :].shape}")
-        print(f"  - y'通道形状: {pam_batch[:, 1, :, :].shape}")
-        print(f"  - c'通道形状: {pam_batch[:, 2, :, :].shape}")
-        break
+    # # 测试数据加载
+    # print("\n测试数据加载...")
+    # for csi_batch, pam_batch in train_loader:
+    #     print(f"CSI数据形状: {csi_batch.shape}")  # [batch_size, 540, 20]
+    #     print(f"PAM标签形状: {pam_batch.shape}")  # [batch_size, 4, 15, 15]
+    #     print(f"  - x'通道形状: {pam_batch[:, 0, :, :].shape}")
+    #     print(f"  - y'通道形状: {pam_batch[:, 1, :, :].shape}")
+    #     print(f"  - c'通道形状: {pam_batch[:, 2, :, :].shape}")
+    #     break
 
     # 训练模型
-    model, test_results = train_wisppn_pam_model(
+    model, test_results = train(
         train_loader, val_loader, test_loader,
         batch_size=batch_size,
         num_epochs=num_epochs,
         learning_rate=learning_rate,
         keypoint_scale=1000.0,
-        output_dir="wisppn_pam_results3"
+        output_dir="perunet"
     )
 
     print("\n训练完成！")
@@ -1247,3 +1363,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
