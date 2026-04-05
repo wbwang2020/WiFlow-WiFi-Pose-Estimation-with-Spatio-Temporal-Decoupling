@@ -81,7 +81,7 @@ class AxialAttention(nn.Module):
 
 
 class DualAxialAttention(nn.Module):
-    """双轴注意力：宽度+高度"""
+    """宽度+高度"""
 
     def __init__(self, in_planes, out_planes, groups=8, stride=1, bias=False):
         super().__init__()
